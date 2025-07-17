@@ -65,6 +65,107 @@ def _layernorm_forward(
         tl.store(y_ptr + cols, y, mask=mask)
 
 
+@triton.jit
+def _layernorm_backward_dLdx(
+    x_ptr,
+    dLdx_ptr,
+    dLdy_ptr,
+    w_ptr,
+    dLdw_inter_ptr,
+    dLdb_inter_ptr,
+    mean_ptr,
+    rstd_ptr,
+    locks_ptr,
+    stride,
+    N,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    PID = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE_N)
+    mask = cols < N
+    x_ptr += PID * stride
+    dLdx_ptr += PID * stride
+    dLdy_ptr += PID * stride
+
+    x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    dLdy = tl.load(dLdy_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=mask).to(tl.float32)
+    mean = tl.load(mean_ptr + PID)
+    rstd = tl.load(rstd_ptr + PID)
+
+    x_normed = tl.where(mask, (x - mean) * rstd, 0.0)
+    dydx_normed = tl.where(mask, w * dLdy, 0.0)
+    c1 = tl.sum(x_normed * dydx_normed, axis=0)
+    c2 = tl.sum(dydx_normed, axis=0) / N
+    dLdx = (dydx_normed - (x_normed * c1 + c2)) * rstd
+
+    tl.store(dLdx_ptr + cols, dLdx, mask=mask)
+
+    dLdw_cont = (dLdy * x_normed).to(w.dtype)
+    dLdb_cont = dLdy.to(w.dtype)
+
+    lock_id = PID % GROUP_SIZE
+    locks_ptr += lock_id
+    count_ptr = locks_ptr + GROUP_SIZE
+
+    dLdw_inter_ptrs = dLdw_inter_ptr + lock_id * N + cols
+    dLdb_inter_ptrs = dLdb_inter_ptr + lock_id * N + cols
+
+    # calculations done beforehand so that we have to lock as little as possible
+    while tl.atomic_cas(locks_ptr, 0, 1) == 1:
+        pass  # if it's 0 (unlocked), change it to 1 (lock it) and return 0 which will evaluate to False and let us leave while loop
+        # if it's 1 (locked) we leave it as 1 and return 1 (evals to True) so we stay in loop
+
+    count = tl.load(count_ptr)  # this count thing is "non-negligible??? maybe"
+    if count == 0:  # no PID has used lock before
+        tl.atomic_xchg(count_ptr, 1)
+
+        tl.store(dLdw_inter_ptrs, dLdw_cont, mask=mask)
+        tl.store(dLdb_inter_ptrs, dLdb_cont, mask=mask)
+
+    else:
+        dLdw_cont += tl.load(dLdw_inter_ptrs, mask=mask)
+        dLdb_cont += tl.load(dLdb_inter_ptrs, mask=mask)
+
+        tl.store(dLdw_inter_ptrs, dLdw_cont, mask=mask)
+        tl.store(dLdb_inter_ptrs, dLdb_cont, mask=mask)
+
+        tl.atomic_xchg(locks_ptr, 0)
+
+
+@triton.jit
+def _layernorm_backward_dLdw_dLdb(
+    dLdw_inter_ptr,
+    dLdb_inter_ptr,
+    dLdw_ptr,
+    dLdb_ptr,
+    GROUP_SIZE,
+    N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    PID = tl.program_id(0)
+    col_offsets = PID * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    dLdw_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    dLdb_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for i in range(0, GROUP_SIZE, BLOCK_SIZE_M):
+        row_offsets = i + tl.arange(0, BLOCK_SIZE_M)
+        mask = (row_offsets[:, None] < GROUP_SIZE) & (col_offsets[None, :] < N)
+        offsets = row_offsets[:, None] * N + col_offsets[None, :]
+
+        dLdw_acc += tl.load(dLdw_inter_ptr + offsets, mask=mask, other=0.0)
+        dLdb_acc += tl.load(dLdb_inter_ptr + offsets, mask=mask, other=0.0)
+
+    dLdw_chunk = tl.sum(dLdw_acc, axis=0)  # shape (BLOCK_SIZE_N)
+    dLdb_chunk = tl.sum(dLdb_acc, axis=0)  # shape (BLOCK_SIZE_N)
+
+    tl.store(dLdw_ptr + col_offsets, dLdw_chunk, mask=col_offsets < N)
+    tl.store(dLdb_ptr + col_offsets, dLdb_chunk, mask=col_offsets < N)
+
+
 class LayerNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, normalized_shape, weight, bias, eps):  # ctx is implied input
@@ -91,6 +192,8 @@ class LayerNorm(torch.autograd.Function):
             mean,
             rstd,
             x.stride(0),  # may need to be -2
+            N,
+            eps,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )  # every single row gets its own program
@@ -104,12 +207,69 @@ class LayerNorm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dLdy):
-        x, w, b, mean, rstd = ctx.saved_tensors()
+        x, w, b, mean, rstd = ctx.saved_tensors
         M, N = x.reshape(-1, x.shape[-1]).shape
 
-        dLdx = torch.empty_like(dLdy)
-        dLdw = torch.empty_like(w)
-        dLdb = torch.empty_like(b)
+        dLdx = torch.empty_like(dLdy)  # (M, N)
+        dLdw = torch.empty_like(
+            w
+        )  # (N), we will have M vectors of length N, we can't just use tl.store as that'll overwrite old data
+        dLdb = torch.empty_like(
+            b
+        )  # (N)... ^ we could load, add, then store back, however, a bunch of PIDS are read/calc writing, so we have to use some locks
+
+        GROUP_SIZE = 64
+        if N <= 8192:
+            GROUP_SIZE = 96
+        if N <= 4096:
+            GROUP_SIZE = 128
+        if N <= 1024:
+            GROUP_SIZE = 256
+
+        dLdw_inter = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device)
+        dLdb_inter = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device)
+
+        locks = torch.zeros(2 * GROUP_SIZE, dtype=torch.int32, device=x.device)
+
+        _layernorm_backward_dLdx[(M,)](
+            x,
+            dLdx,
+            dLdy,
+            w,
+            dLdw_inter,
+            dLdb_inter,
+            mean,
+            rstd,
+            locks,
+            x.stride(0),
+            N,
+            GROUP_SIZE=GROUP_SIZE,
+            BLOCK_SIZE_N=ctx.BLOCK_SIZE,
+            num_warps=ctx.num_warps,
+        )
+
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
+        _layernorm_backward_dLdw_dLdb[grid](
+            dLdw_inter,
+            dLdb_inter,
+            dLdw,
+            dLdb,
+            min(GROUP_SIZE, M),
+            N,
+            BLOCK_SIZE_M=32,
+            BLOCK_SIZE_N=128,
+        )
+
+        return (
+            dLdx,
+            None,
+            dLdw,
+            dLdb,
+            None,
+        )  # outputs have to correspont to inputs of forward pass, pytorch knows which is which based on ordering
+
+
+layernorm = LayerNorm.apply
 
 
 # step 1
@@ -117,10 +277,10 @@ def test_layernorm_kernel(M, N, dtype, eps=1e-5, device=DEVICE):
     x = -2.3 + 0.5 * torch.randn((M, N), dtype=dtype, device=device)
     x.requires_grad_(True)
 
-    weight = torch.rand((N,), dtype, device, requires_grad=True)
-    bias = torch.rand((N,), dtype, device, requires_grad=True)
+    weight = torch.rand((N,), dtype=dtype, device=device, requires_grad=True)
+    bias = torch.rand((N,), dtype=dtype, device=device, requires_grad=True)
 
-    y_tri = LayerNorm(x, (N,), weight, bias, eps)
+    y_tri = layernorm(x, (N,), weight, bias, eps)
     y_ref = torch.nn.functional.layer_norm(x, (N,), weight, bias, eps).to(dtype)
 
     torch.testing.assert_close(y_tri, y_ref, atol=1e-2, rtol=0)
@@ -140,3 +300,6 @@ def test_layernorm_kernel(M, N, dtype, eps=1e-5, device=DEVICE):
     torch.testing.assert_close(dLdb_tri, dLdb_ref, atol=1e-2, rtol=0)
 
     print("passed bwd")
+
+
+test_layernorm_kernel(1151, 8192, torch.float16)
